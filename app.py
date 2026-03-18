@@ -1,13 +1,14 @@
 import io
+import os
 import tempfile
 import shutil
 
 import streamlit as st
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 
 from scipy.io import loadmat
-from matplotlib import cm
 from matplotlib import colors as mcolors
 from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
 from matplotlib.collections import LineCollection
@@ -28,11 +29,10 @@ st.write("Upload circle and dot trajectory files to generate plots and playback.
 def moving_average(x: np.ndarray, window: int) -> np.ndarray:
     if window <= 1:
         return x
-    kernel = np.ones(window) / window
+    kernel = np.ones(window, dtype=float) / window
     return np.convolve(x, kernel, mode="same")
 
 
-@st.cache_data(show_spinner=False)
 def load_tracking_data(file_bytes: bytes, filename: str):
     data = loadmat(io.BytesIO(file_bytes))
 
@@ -51,7 +51,6 @@ def apply_row_mapping(Xd: np.ndarray, Yd: np.ndarray, mapping_option: str):
     return Xd, Yd
 
 
-@st.cache_data(show_spinner=False)
 def compute_base_quantities(Xc: np.ndarray, Yc: np.ndarray, Xd: np.ndarray, Yd: np.ndarray, fps: int):
     dt = 1.0 / fps
     bots = Xc.shape[0]
@@ -101,7 +100,7 @@ def maybe_smooth(x: np.ndarray | None, enabled: bool, window: int):
 
 def fig_to_png_bytes(fig) -> bytes:
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
     buf.seek(0)
     return buf.getvalue()
 
@@ -113,6 +112,19 @@ def file_to_bytes(path: str) -> bytes:
 
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def cleanup_playback_file():
+    old_path = st.session_state.get("playback_path")
+    if old_path and os.path.exists(old_path):
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+
+    st.session_state.pop("playback_path", None)
+    st.session_state.pop("playback_mime", None)
+    st.session_state.pop("playback_format", None)
 
 
 def add_direction_arrows(
@@ -199,12 +211,12 @@ def plot_trajectory(
             points = np.array([x, y]).T.reshape(-1, 1, 2)
             segments = np.concatenate([points[:-1], points[1:]], axis=1)
 
-            tvals = np.linspace(0, 1, len(segments))
+            tvals = np.linspace(cmins[i], cmaxs[i], len(segments))
             norm = mcolors.Normalize(vmin=cmins[i], vmax=cmaxs[i])
 
             lc = LineCollection(
                 segments,
-                cmap=cm.get_cmap(cmap_names[i]),
+                cmap=matplotlib.colormaps.get_cmap(cmap_names[i]),
                 norm=norm,
                 linewidth=linewidth,
             )
@@ -255,8 +267,8 @@ def plot_trajectory(
 
     if len(colorbar_info) == 1:
         i, cmap_name, cmin, cmax = colorbar_info[0]
-        sm = cm.ScalarMappable(
-            cmap=cm.get_cmap(cmap_name),
+        sm = plt.cm.ScalarMappable(
+            cmap=matplotlib.colormaps.get_cmap(cmap_name),
             norm=mcolors.Normalize(vmin=cmin, vmax=cmax),
         )
         sm.set_array([])
@@ -265,8 +277,8 @@ def plot_trajectory(
 
     elif len(colorbar_info) >= 2:
         i1, cmap1, cmin1, cmax1 = colorbar_info[0]
-        sm1 = cm.ScalarMappable(
-            cmap=cm.get_cmap(cmap1),
+        sm1 = plt.cm.ScalarMappable(
+            cmap=matplotlib.colormaps.get_cmap(cmap1),
             norm=mcolors.Normalize(vmin=cmin1, vmax=cmax1),
         )
         sm1.set_array([])
@@ -274,8 +286,8 @@ def plot_trajectory(
         cbar1.set_label(f"Bot {i1+1} time")
 
         i2, cmap2, cmin2, cmax2 = colorbar_info[1]
-        sm2 = cm.ScalarMappable(
-            cmap=cm.get_cmap(cmap2),
+        sm2 = plt.cm.ScalarMappable(
+            cmap=matplotlib.colormaps.get_cmap(cmap2),
             norm=mcolors.Normalize(vmin=cmin2, vmax=cmax2),
         )
         sm2.set_array([])
@@ -424,6 +436,7 @@ def _build_playback_animation(
     colors: list[str],
     line_width: int,
     fps_data: int,
+    max_export_frames: int = 400,
 ):
     fig, ax = plt.subplots(figsize=(6, 6))
 
@@ -465,8 +478,16 @@ def _build_playback_animation(
         dot_artists.append(small_dot)
 
     frame_indices = list(range(start_frame, end_frame + 1, frame_step))
+    if not frame_indices:
+        frame_indices = [start_frame]
     if frame_indices[-1] != end_frame:
         frame_indices.append(end_frame)
+
+    if len(frame_indices) > max_export_frames:
+        stride = int(np.ceil(len(frame_indices) / max_export_frames))
+        frame_indices = frame_indices[::stride]
+        if frame_indices[-1] != end_frame:
+            frame_indices.append(end_frame)
 
     def update(frame_idx):
         idx = frame_indices[frame_idx]
@@ -485,7 +506,7 @@ def _build_playback_animation(
         interval=interval,
         blit=False
     )
-    return fig, anim
+    return fig, anim, len(frame_indices)
 
 
 def generate_playback_file(
@@ -504,7 +525,7 @@ def generate_playback_file(
     fps_data: int,
     output_format: str,
 ):
-    fig, anim = _build_playback_animation(
+    fig, anim, exported_frames = _build_playback_animation(
         Xc, Yc, Xd, Yd,
         start_frame, end_frame,
         circle_radius, dot_radius,
@@ -513,29 +534,26 @@ def generate_playback_file(
         fps_data
     )
 
-    if output_format == "GIF":
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".gif")
-        fps_out = max(1, int(1000 / interval))
-        anim.save(tmp.name, writer=PillowWriter(fps=fps_out))
-        plt.close(fig)
-        return tmp.name, "image/gif"
+    fps_out = max(1, int(1000 / interval))
 
-    if output_format == "MP4":
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        fps_out = max(1, int(1000 / interval))
-        try:
+    try:
+        if output_format == "GIF":
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".gif")
+            tmp.close()
+            anim.save(tmp.name, writer=PillowWriter(fps=fps_out))
+            return tmp.name, "image/gif", exported_frames
+
+        if output_format == "MP4":
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tmp.close()
             writer = FFMpegWriter(fps=fps_out, bitrate=1800)
             anim.save(tmp.name, writer=writer)
-        except Exception as e:
-            plt.close(fig)
-            raise RuntimeError(
-                f"MP4 export failed. This usually means ffmpeg is not installed or not available. Original error: {e}"
-            )
-        plt.close(fig)
-        return tmp.name, "video/mp4"
+            return tmp.name, "video/mp4", exported_frames
 
-    plt.close(fig)
-    raise ValueError("Unsupported output format.")
+        raise ValueError("Unsupported output format.")
+
+    finally:
+        plt.close(fig)
 
 
 # =========================================================
@@ -553,6 +571,7 @@ mapping_option = st.sidebar.selectbox(
 fps = st.sidebar.number_input("Frames per second (fps)", min_value=1, value=30)
 
 if circle_file is None or dot_file is None:
+    cleanup_playback_file()
     st.info("Please upload both the circle file and the dot file.")
     st.stop()
 
@@ -578,6 +597,7 @@ try:
         st.stop()
 
 except Exception as e:
+    cleanup_playback_file()
     st.error(f"Error loading files: {e}")
     st.stop()
 
@@ -714,10 +734,13 @@ with plot_col:
         arrow_size=traj_arrow_size,
     )
 
+    traj_png = fig_to_png_bytes(fig_traj)
     st.pyplot(fig_traj)
+    plt.close(fig_traj)
+
     st.download_button(
         label="Download trajectory plot (PNG)",
-        data=fig_to_png_bytes(fig_traj),
+        data=traj_png,
         file_name="trajectory_plot.png",
         mime="image/png",
         key="dl_traj"
@@ -751,11 +774,18 @@ with plot_col:
     play_colors = [play_color_1, play_color_2] + default_colors[2:]
 
     generate_playback_btn = st.button("Generate Playback", key="generate_playback_btn")
+    clear_playback_btn = st.button("Clear Playback", key="clear_playback_btn")
+
+    if clear_playback_btn:
+        cleanup_playback_file()
+        st.success("Playback file cleared.")
 
     if generate_playback_btn:
+        cleanup_playback_file()
+
         try:
             with st.spinner(f"Generating {play_format} playback..."):
-                playback_path, playback_mime = generate_playback_file(
+                playback_path, playback_mime, exported_frames = generate_playback_file(
                     Xc, Yc, Xd, Yd,
                     start_frame=play_range[0],
                     end_frame=play_range[1],
@@ -772,14 +802,23 @@ with plot_col:
             st.session_state["playback_path"] = playback_path
             st.session_state["playback_mime"] = playback_mime
             st.session_state["playback_format"] = play_format
+            st.session_state["playback_frames"] = exported_frames
 
         except Exception as e:
-            st.error(str(e))
+            cleanup_playback_file()
+            st.error(
+                "Playback generation failed. "
+                f"Original error: {e}"
+            )
 
     if "playback_path" in st.session_state:
         playback_path = st.session_state["playback_path"]
         playback_mime = st.session_state["playback_mime"]
         play_format_saved = st.session_state["playback_format"]
+        exported_frames = st.session_state.get("playback_frames")
+
+        if exported_frames is not None:
+            st.caption(f"Exported frames: {exported_frames}")
 
         if play_format_saved == "GIF":
             st.image(playback_path)
@@ -822,10 +861,13 @@ with plot_col:
             start_frame=dist_range[0],
             end_frame=dist_range[1]
         )
+        dist_png = fig_to_png_bytes(fig_dist)
         st.pyplot(fig_dist)
+        plt.close(fig_dist)
+
         st.download_button(
             label="Download distance plot (PNG)",
-            data=fig_to_png_bytes(fig_dist),
+            data=dist_png,
             file_name="distance_plot.png",
             mime="image/png",
             key="dl_dist"
@@ -860,10 +902,13 @@ with plot_col:
         start_frame=phase_range[0],
         end_frame=phase_range[1]
     )
+    phase_png = fig_to_png_bytes(fig_phase)
     st.pyplot(fig_phase)
+    plt.close(fig_phase)
+
     st.download_button(
         label="Download phase plot (PNG)",
-        data=fig_to_png_bytes(fig_phase),
+        data=phase_png,
         file_name="phase_plot.png",
         mime="image/png",
         key="dl_phase"
@@ -896,10 +941,13 @@ with plot_col:
         start_frame=omega_range[0],
         end_frame=omega_range[1]
     )
+    omega_png = fig_to_png_bytes(fig_omega)
     st.pyplot(fig_omega)
+    plt.close(fig_omega)
+
     st.download_button(
         label="Download angular velocity plot (PNG)",
-        data=fig_to_png_bytes(fig_omega),
+        data=omega_png,
         file_name="angular_velocity_plot.png",
         mime="image/png",
         key="dl_omega"
@@ -929,10 +977,13 @@ with plot_col:
             start_frame=orient_range[0],
             end_frame=orient_range[1]
         )
+        orient_png = fig_to_png_bytes(fig_orient)
         st.pyplot(fig_orient)
+        plt.close(fig_orient)
+
         st.download_button(
             label="Download orientation plot (PNG)",
-            data=fig_to_png_bytes(fig_orient),
+            data=orient_png,
             file_name="particle_particle_orientation.png",
             mime="image/png",
             key="dl_orient"
@@ -949,3 +1000,5 @@ st.subheader("Data Summary")
 st.write(f"Number of bots: {bots}")
 st.write(f"Number of frames: {n_frames}")
 st.write(f"Data shape: {Xc.shape}")
+st.write(f"Circle file size: {len(circle_bytes) / 1024 / 1024:.2f} MB")
+st.write(f"Dot file size: {len(dot_bytes) / 1024 / 1024:.2f} MB")
