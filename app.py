@@ -749,23 +749,39 @@ with ctrl_col:
 
 with plot_col:
     play_colors = [play_color_1, play_color_2] + default_colors[2:]
-    try:
-        with st.spinner(f"Generating {play_format} playback..."):
-            playback_path, playback_mime = generate_playback_file(
-                Xc, Yc, Xd, Yd,
-                start_frame=play_range[0],
-                end_frame=play_range[1],
-                circle_radius=circle_radius,
-                dot_radius=dot_radius,
-                frame_step=play_frame_step,
-                interval=play_interval,
-                colors=play_colors,
-                line_width=play_linewidth,
-                fps_data=fps,
-                output_format=play_format
-            )
 
-        if play_format == "GIF":
+    generate_playback_btn = st.button("Generate Playback", key="generate_playback_btn")
+
+    if generate_playback_btn:
+        try:
+            with st.spinner(f"Generating {play_format} playback..."):
+                playback_path, playback_mime = generate_playback_file(
+                    Xc, Yc, Xd, Yd,
+                    start_frame=play_range[0],
+                    end_frame=play_range[1],
+                    circle_radius=circle_radius,
+                    dot_radius=dot_radius,
+                    frame_step=play_frame_step,
+                    interval=play_interval,
+                    colors=play_colors,
+                    line_width=play_linewidth,
+                    fps_data=fps,
+                    output_format=play_format
+                )
+
+            st.session_state["playback_path"] = playback_path
+            st.session_state["playback_mime"] = playback_mime
+            st.session_state["playback_format"] = play_format
+
+        except Exception as e:
+            st.error(str(e))
+
+    if "playback_path" in st.session_state:
+        playback_path = st.session_state["playback_path"]
+        playback_mime = st.session_state["playback_mime"]
+        play_format_saved = st.session_state["playback_format"]
+
+        if play_format_saved == "GIF":
             st.image(playback_path)
             download_name = "generated_playback.gif"
         else:
@@ -773,14 +789,14 @@ with plot_col:
             download_name = "generated_playback.mp4"
 
         st.download_button(
-            label=f"Download playback ({play_format})",
+            label=f"Download playback ({play_format_saved})",
             data=file_to_bytes(playback_path),
             file_name=download_name,
             mime=playback_mime,
             key="dl_playback"
         )
-    except Exception as e:
-        st.error(str(e))
+    else:
+        st.info("Click 'Generate Playback' to create the animation.")
 
 
 # =========================================================
